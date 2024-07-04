@@ -1,0 +1,25 @@
+{
+    "run": "cifar-bf16-512epoch",
+    "epochs": 512,
+    "max_timestep": 128,
+    "dtype": "bf16",
+    "dataset_type": "cifar-10",
+    "model": {
+        "num_attention_heads": 8,
+        "attention_head_dim": 32,
+        "in_channels": 3,
+        "out_channels": null,
+        "num_layers": 4,
+        "dropout": 0.0,
+        "norm_num_groups": 16,
+        "attention_bias": true,
+        "sample_size": 28,
+        "patch_size": 2,
+        "activation_fn": "gelu-approximate",
+        "num_embeds_ada_norm": 10,
+        "upcast_attention": false,
+        "norm_type": "ada_norm_zero",
+        "norm_elementwise_affine": false,
+        "norm_eps": 1e-05
+    }
+}
