@@ -9,6 +9,7 @@ from torchvision.transforms import v2
 import wandb
 import json
 import argparse
+import os
 
 wandb.login()
 
@@ -41,6 +42,17 @@ def get_dataset(dataset_type, data_dir):
              v2.Normalize(mean=[0.5], std=[0.5])], 
             )
         dataset = torchvision.datasets.CIFAR10(data_dir, download=True, transform=transform)
+        return dataset
+    elif dataset_type == "imagenet-32":
+        from imagenet import ImageNetDownSample
+        transform = v2.Compose(
+            [v2.ToImage(),
+             v2.RandomHorizontalFlip(0.5),
+             v2.ToDtype(torch.float32, scale=True),
+             v2.ToPureTensor(),
+             v2.Normalize(mean=[0.5], std=[0.5])], 
+            )
+        dataset = ImageNetDownSample(os.path.join(data_dir, "Imagenet32"), transform=transform)
         return dataset
     else:
         assert False
