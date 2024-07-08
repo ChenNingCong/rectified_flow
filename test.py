@@ -106,4 +106,17 @@ print(create_run_config("imagenet32-bf16-128epoch-50M-t-256", base_config, {"dty
                                                                  "num_layers": 12,
                                                                  "num_embeds_ada_norm": 1000,
                                                                  "norm_num_groups": 32,
-                                                                 "in_channels" : 3}}))                                                                 
+                                                                 "in_channels" : 3}})) 
+
+# imagenet is 10x larger than cifar, so we shrink the epoch size...
+print(create_run_config("imagenet32-bf16-128epoch-100M-t-256", base_config, {"dtype" : "bf16", 
+                                                             "dataset_type" : "imagenet-32", 
+                                                             "epochs" : 128,
+                                                             "max_timestep" : 256,
+                                                             "model" : {
+                                                                 "num_attention_heads": 12,
+                                                                 "attention_head_dim": 32,
+                                                                 "num_layers": 24,
+                                                                 "num_embeds_ada_norm": 1000,
+                                                                 "norm_num_groups": 32,
+                                                                 "in_channels" : 3}}))                                                                   
