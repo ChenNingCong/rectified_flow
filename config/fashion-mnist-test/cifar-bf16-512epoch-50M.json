@@ -13,7 +13,7 @@
         "dropout": 0.0,
         "norm_num_groups": 32,
         "attention_bias": true,
-        "sample_size": 28,
+        "sample_size": 32,
         "patch_size": 2,
         "activation_fn": "gelu-approximate",
         "num_embeds_ada_norm": 10,

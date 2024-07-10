@@ -17,9 +17,39 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from timer import Timer
+import numpy as np
+from typing import Any, Tuple, List
+
+from streaming.vision.base import StreamingDataset
+from streaming.base.format.mds.encodings import Encoding, _encodings
+import streaming
+from dataclasses import dataclass
+
+from diffusers import AutoencoderKL
+from diffusers.image_processor import VaeImageProcessor
+
+@dataclass
+class ImageDatasetInfo:
+    dataset : Any
+    is_streaming_dataset : bool
+    image_shape : Tuple[int, int, int]
+    classes : List[str]
+
+    is_latent : bool
+    vae : Any
+    vae_preprocessor : Any
+    vae_postprocessor : Any
 
 # === data ===
-def get_dataset(dataset_type, data_dir):
+def get_dataset(rank : int, dataset_type, data_dir, temp_dir, batch_size : int) -> ImageDatasetInfo:
+    # the batch_size here is per device batch_size
+    image_shape = None
+    is_streaming_dataset = False
+    classes = None
+    is_latent = False
+    vae = None
+    vae_preprocessor = None
+    vae_postprocessor = None
     if dataset_type == "mnist":    
         transform = v2.Compose(
             [v2.ToImage(),
@@ -28,7 +58,6 @@ def get_dataset(dataset_type, data_dir):
              v2.Normalize(mean=[0.5], std=[0.5])], 
             )
         dataset = torchvision.datasets.MNIST(data_dir, download=True, transform=transform)
-        return dataset
     elif dataset_type == "fashion-mnist":
         transform = v2.Compose(
             [v2.ToImage(),
@@ -38,7 +67,6 @@ def get_dataset(dataset_type, data_dir):
              v2.Normalize(mean=[0.5], std=[0.5])] 
             )
         dataset = torchvision.datasets.FashionMNIST(data_dir, download=True, transform=transform)
-        return dataset
     elif dataset_type == "cifar-10":
         transform = v2.Compose(
             [v2.ToImage(),
@@ -48,7 +76,6 @@ def get_dataset(dataset_type, data_dir):
              v2.Normalize(mean=[0.5], std=[0.5])], 
             )
         dataset = torchvision.datasets.CIFAR10(data_dir, download=True, transform=transform)
-        return dataset
     elif dataset_type == "imagenet-32":
         from imagenet import ImageNetDownSample
         transform = v2.Compose(
@@ -59,9 +86,53 @@ def get_dataset(dataset_type, data_dir):
              v2.Normalize(mean=[0.5], std=[0.5])], 
             )
         dataset = ImageNetDownSample(os.path.join(data_dir, "Imagenet32"), transform=transform)
-        return dataset
-    else:
-        assert False
+    elif dataset_type == 'imagenet.uint8':
+        is_streaming_dataset = True
+        image_shape = (4, 32, 32)
+        is_latent = True  
+        class uint8(Encoding):
+            def encode(self, obj: Any) -> bytes:
+                return obj.tobytes()
+
+            def decode(self, data: bytes) -> Any:
+                x=  np.frombuffer(data, np.uint8).astype(np.float32)
+                return (x / 255.0 - 0.5) * 24.0
+        _encodings['uint8'] = uint8
+        # we must use the same temporary data directory here
+        local = temp_dir
+        remote = os.path.join(data_dir, "vae_mds")
+        class DatasetAdaptor(StreamingDataset):
+            def __init__(self,
+                        *args, 
+                        **kwargs
+                        ) -> None:
+                super().__init__(*args, **kwargs)
+            def __getitem__(self, idx:int):
+                obj = super().__getitem__(idx)
+                x = obj['vae_output']
+                y = obj['label']
+                return x.reshape(4, 32, 32) / 12, int(y)
+        # the raw data is a tensor with value in range [-12, 12]
+        # this is difficult for the model to learn, so we firstly scale the tensor into [-1, 1]
+        # then we rescale the learnt model into [-12, 12] before sampling
+        dataset = DatasetAdaptor(
+            local=local, 
+            remote=remote, 
+            split=None,
+            shuffle=True,
+            shuffle_algo="naive",
+            num_canonical_nodes=1,
+            batch_size = batch_size)
+        classes = [str(i) for i in range(1000)]
+        vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae").to(rank)
+        vae_preprocessor = lambda x : x * 12
+        vae = vae.eval()
+        vae_postprocessor = VaeImageProcessor(do_normalize=True)
+    if image_shape is None:
+        image_shape = dataset[0][0].shape
+    if classes is None:
+        classes = dataset.classes
+    return ImageDatasetInfo(dataset, is_streaming_dataset, image_shape, classes, is_latent, vae, vae_preprocessor, vae_postprocessor)
 
 def make_dataloader(*args, use_fake=False, **kwargs):
     if use_fake:
@@ -75,7 +146,8 @@ def make_dataloader(*args, use_fake=False, **kwargs):
 
 # === training and evaluation ===
 @torch.no_grad
-def sample_image(model, max_timestep, image_shape, batch_size, class_labels, use_classlabel, device):
+def sample_image(model, max_timestep, batch_size, class_labels, datasetinfo : ImageDatasetInfo, use_classlabel, device):
+    image_shape = datasetinfo.image_shape
     X0 = torch.randn((batch_size, *image_shape)).to(device)
     for i in range(max_timestep):
         timestep = torch.full(size=(batch_size,), fill_value=i).to(device)
@@ -84,6 +156,9 @@ def sample_image(model, max_timestep, image_shape, batch_size, class_labels, use
         else:
             pred = model(X0, timestep=timestep)
         X0 += pred.sample * (1/max_timestep)
+    if datasetinfo.is_latent:
+        X0 = datasetinfo.vae_preprocessor(X0)
+        X0 = datasetinfo.vae.decode(X0).sample
     return X0
 
 def train_rectified_flow(rank : int,
@@ -92,18 +167,15 @@ def train_rectified_flow(rank : int,
                          optimizer, 
                          dataloader,
                          sampler, 
-                         image_shape,
-                         max_class = None,
-                         use_classlabel = False,
+                         datasetinfo : ImageDatasetInfo,
+                         use_classlabel = True,
                          max_timestep = 1000,
                          epoch = 16, 
                          dtype = torch.float16):
     device = rank
-    if use_classlabel:
-        assert max_class is not None
     loss_fun = torch.nn.MSELoss()
+    max_class = len(datasetinfo.classes)
     def normalize_image(X):
-        X = torchvision.utils.make_grid(X)
         X = (X + 1)/2
         return X
     def eval_image():
@@ -112,10 +184,10 @@ def train_rectified_flow(rank : int,
         batch_size = 64 // world_size
         class_labels = torch.arange(batch_size, device=rank) % max_class 
         image_array = sample_image(model, 
-                                   max_timestep, 
-                                   image_shape = image_shape, 
+                                   max_timestep,
                                    batch_size = batch_size, 
                                    class_labels = class_labels,
+                                   datasetinfo = datasetinfo,
                                    use_classlabel = use_classlabel,
                                    device= device)
         
@@ -123,14 +195,18 @@ def train_rectified_flow(rank : int,
         dist.all_gather(image_arrays, image_array)
         if rank == 0:
             image_array = torch.cat(image_arrays, dim = 0)
-            image_array = normalize_image(image_array).permute((1,2,0)).cpu().detach().numpy()
+            if datasetinfo.is_latent:
+                image_array = datasetinfo.vae_postprocessor.postprocess(image = image_array, output_type='pt')
+            else:
+                image_array = normalize_image(image_array)
+            image_array = torchvision.utils.make_grid(image_array).permute((1,2,0)).detach().cpu().numpy()
             images = wandb.Image(image_array, caption="Top: Output, Bottom: Input")
             wandb.log({"examples": images}, commit=False)
 
     timer = Timer()      
     scaler = torch.GradScaler()    
 
-    for i in range(epoch):
+    for i in tqdm(range(epoch), position=0, leave=True):
         if i == 0:
             eval_image()
         # reset sampler
@@ -138,7 +214,7 @@ def train_rectified_flow(rank : int,
             sampler.set_epoch(i)
         if rank == 0:
             wandb.log({"epoch": i}, commit=False)
-        for (image, class_labels) in dataloader:
+        for (image, class_labels) in tqdm(dataloader, position=0, leave=True):
             model.train()
             # image : shape (b, c, h, w)
             optimizer.zero_grad(set_to_none = True)
@@ -193,7 +269,9 @@ def get_dtype_str(x):
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
-
+    os.environ['LOCAL_WORLD_SIZE'] = str(world_size)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['RANK'] = str(rank)
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
@@ -202,7 +280,7 @@ def cleanup():
     dist.destroy_process_group()
 
 # Define a closure here, so all the variables above are accessible here.... 
-def main(rank, world_size, args, config):
+def main(rank, world_size, temp_dir, args, config):
     setup(rank, world_size)
     # Setting model configuration
     lr = config.get("lr", 1e-4)
@@ -219,14 +297,34 @@ def main(rank, world_size, args, config):
     dtype = dtypemap[dtype]
     dataset_type = config["dataset_type"]
     data_dir = args.data_dir
-    dataset = get_dataset(dataset_type, data_dir)
-    image_shape = dataset[0][0].shape
+    
+    streaming.base.util.clean_stale_shared_memory()
+    assert batch_size % world_size == 0
+    per_device_batch_size = batch_size // world_size
+    datasetinfo = get_dataset(rank, dataset_type, data_dir, temp_dir, batch_size=per_device_batch_size)
+    print(datasetinfo)
+    dataset = datasetinfo.dataset
+    if datasetinfo.is_streaming_dataset:
+        sampler = None
+        # no need to shuffle here
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=per_device_batch_size, drop_last=True)
+    else:
+        if world_size == 1:
+            sampler = None
+            dataloader = make_dataloader(dataset, use_fake=use_fake, batch_size=batch_size, drop_last=True, shuffle=True)
+        else:
+            sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed = 0, drop_last=True)
+            dataloader = torch.utils.data.DataLoader(dataset, batch_size=per_device_batch_size, sampler=sampler)
+
     # num_embeds_ada_norm = len(dataset.classes)
     model_config = config["model"]
     # we only call wandb in the first process
     if rank == 0:
         print(model_config)
         wandb.login()
+        mode = None
+        if args.nowandb:
+            mode = 'disabled'
         wandb.init(
             # Set the project where this run will be logged
             project="dit-rectified-flow",
@@ -243,20 +341,24 @@ def main(rank, world_size, args, config):
                 "dataset_type" : dataset_type,
                 "dtype" : str(dtype),
             },
-            name = config["run"]
+            name = config["run"],
+            mode = mode
         )
-    model = diffusers.DiTTransformer2DModel(**model_config).to(rank)
+    model_type = "hf"
+    if "model_type" in config:
+        model_type = config["model_type"]
+    assert model_type in ["hf", "origin"]
+    if model_type == "hf":
+        model = diffusers.DiTTransformer2DModel(**model_config)
+    else:
+        from model import DiTModelWrapper
+        model = DiTModelWrapper(**model_config)
+    model = model.to(rank)
     model = DDP(model)
     if rank == 0:
+        print(model)
         print("model size:", sum([p.numel() for p in model.parameters()]))
     optimizer = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=torch.optim.AdamW, lr = lr, weight_decay=0.0)
-    if world_size == 1:
-        sampler = None
-        dataloader = make_dataloader(dataset, use_fake=use_fake, batch_size=batch_size, drop_last=True, shuffle=True)
-    else:
-        assert batch_size % world_size == 0
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed = 0, drop_last=True)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size // world_size, sampler=sampler)
     train_rectified_flow(
                     rank,
                     world_size,
@@ -264,10 +366,9 @@ def main(rank, world_size, args, config):
                     optimizer, 
                     dataloader, 
                     sampler,
-                    image_shape,
-                    use_classlabel=True, 
-                    max_class = len(dataset.classes),
-                    max_timestep=max_timestep, epoch=epochs,
+                    datasetinfo,
+                    max_timestep=max_timestep, 
+                    epoch=epochs,
                     dtype = dtype)
     if rank == 0:
         wandb.finish()
@@ -278,6 +379,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', type = str)
     parser.add_argument('--data_dir', type = str)
     parser.add_argument('--ddp', type=int)
+    parser.add_argument('--nowandb', action='store_true')
     args = parser.parse_args()
     with open(args.config) as f:
         config = json.load(f)
@@ -292,5 +394,7 @@ if __name__ == '__main__':
     np.random.seed(0)
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
-
-    mp.spawn(main, args=(world_size, args, config), nprocs=world_size, join=True)
+    
+    import tempfile
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mp.spawn(main, args=(world_size, temp_dir, args, config), nprocs=world_size, join=True)
