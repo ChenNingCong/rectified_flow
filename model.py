@@ -13,8 +13,14 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.models.vision_transformer import PatchEmbed, Mlp
+from timm.models.vision_transformer import Attention as NormalAttention
+from rotary_attention import RotaryAttention
 
+from enum import Enum
+class AttentionType(Enum):
+    NormalAttention = 1
+    RotaryAttention = 2
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -102,10 +108,13 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, grid_size : int, hidden_size, num_heads, mlp_ratio=4.0, attention_type : AttentionType = AttentionType.NormalAttention, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        if attention_type == AttentionType.NormalAttention:
+            self.attn = NormalAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        else:
+            self.attn = RotaryAttention(grid_size, hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -158,6 +167,7 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        attention_type : AttentionType = AttentionType.NormalAttention
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -165,6 +175,7 @@ class DiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.attention_type = attention_type
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -173,8 +184,9 @@ class DiT(nn.Module):
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
+        grid_size = input_size // patch_size
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            DiTBlock(grid_size, hidden_size, num_heads, mlp_ratio=mlp_ratio, attention_type=attention_type) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
@@ -237,7 +249,9 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        x = self.x_embedder(x)
+        if self.attention_type == AttentionType.NormalAttention:
+            x += self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
@@ -401,11 +415,17 @@ def DiTModelWrapper(
         upcast_attention: bool = False,
         norm_type: str = "ada_norm_zero",
         norm_elementwise_affine: bool = False,
-        norm_eps: float = 1e-5,):
+        norm_eps: float = 1e-5,
+        attention_type : str = "NormalAttention"):
     assert out_channels is None or out_channels == in_channels
     assert norm_eps == 1e-5
     assert not norm_elementwise_affine
     assert norm_type == "ada_norm_zero"
+    if attention_type == "NormalAttention":
+        attention_type = AttentionType.NormalAttention
+    else:
+        assert attention_type == "RotaryAttention"
+        attention_type = AttentionType.RotaryAttention
     return DiTTransformer(
         input_size=sample_size,
         patch_size=patch_size,
@@ -417,4 +437,5 @@ def DiTModelWrapper(
         class_dropout_prob=0.1,
         num_classes=num_embeds_ada_norm,
         learn_sigma=False,
+        attention_type = attention_type
     )

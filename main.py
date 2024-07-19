@@ -101,6 +101,9 @@ def get_dataset(rank : int, dataset_type, data_dir, temp_dir, batch_size : int) 
         # we must use the same temporary data directory here
         local = temp_dir
         remote = os.path.join(data_dir, "vae_mds")
+        # we should use this new scaling factor
+        # the variance of input now will be 1
+        scaling_factor = 1 / 0.13025
         class DatasetAdaptor(StreamingDataset):
             def __init__(self,
                         *args, 
@@ -111,7 +114,7 @@ def get_dataset(rank : int, dataset_type, data_dir, temp_dir, batch_size : int) 
                 obj = super().__getitem__(idx)
                 x = obj['vae_output']
                 y = obj['label']
-                return x.reshape(4, 32, 32) / 12, int(y)
+                return x.reshape(4, 32, 32) / scaling_factor, int(y)
         # the raw data is a tensor with value in range [-12, 12]
         # this is difficult for the model to learn, so we firstly scale the tensor into [-1, 1]
         # then we rescale the learnt model into [-12, 12] before sampling
@@ -125,7 +128,7 @@ def get_dataset(rank : int, dataset_type, data_dir, temp_dir, batch_size : int) 
             batch_size = batch_size)
         classes = [str(i) for i in range(1000)]
         vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae").to(rank)
-        vae_preprocessor = lambda x : x * 12
+        vae_preprocessor = lambda x : x * scaling_factor
         vae = vae.eval()
         vae_postprocessor = VaeImageProcessor(do_normalize=True)
     if image_shape is None:
@@ -146,9 +149,12 @@ def make_dataloader(*args, use_fake=False, **kwargs):
 
 # === training and evaluation ===
 @torch.no_grad
-def sample_image(model, max_timestep, batch_size, class_labels, datasetinfo : ImageDatasetInfo, use_classlabel, device):
+def sample_image(rank : int, model, max_timestep, batch_size, class_labels, datasetinfo : ImageDatasetInfo, use_classlabel, device):
     image_shape = datasetinfo.image_shape
-    X0 = torch.randn((batch_size, *image_shape)).to(device)
+    # we add a generator to better monitor the quality here
+    generator = torch.Generator()
+    generator = generator.manual_seed(rank)
+    X0 = torch.randn((batch_size, *image_shape), generator=generator).to(device)
     for i in range(max_timestep):
         timestep = torch.full(size=(batch_size,), fill_value=i).to(device)
         if use_classlabel:
@@ -161,17 +167,27 @@ def sample_image(model, max_timestep, batch_size, class_labels, datasetinfo : Im
         X0 = datasetinfo.vae.decode(X0).sample
     return X0
 
+import math
+def lmpdf(y):
+    x1 = math.exp(-(math.log(y/(1-y))**2)/2)
+    x2 = math.sqrt(2 * math.pi) * y * (1-y)
+    return x1/x2
+
 def train_rectified_flow(rank : int,
                          world_size : int,
                          model, 
                          optimizer, 
+                         scheduler,
                          dataloader,
                          sampler, 
                          datasetinfo : ImageDatasetInfo,
                          use_classlabel = True,
                          max_timestep = 1000,
                          epoch = 16, 
-                         dtype = torch.float16):
+                         dtype = torch.float16,
+                         sample_type = "uniform"):
+    if dtype == torch.float32:
+        torch.set_float32_matmul_precision("high")
     device = rank
     loss_fun = torch.nn.MSELoss()
     max_class = len(datasetinfo.classes)
@@ -181,9 +197,13 @@ def train_rectified_flow(rank : int,
     def eval_image():
         model.eval()
         assert world_size < 64 and 64 % world_size == 0
-        batch_size = 64 // world_size
-        class_labels = torch.arange(batch_size, device=rank) % max_class 
-        image_array = sample_image(model, 
+        total_batch_size = 64
+        class_labels = torch.arange(total_batch_size, device=rank) % max_class 
+        step = total_batch_size // world_size
+        class_labels = class_labels[(rank*step):((rank+1)*step)]
+        batch_size = step
+        image_array = sample_image(rank,
+                                   model, 
                                    max_timestep,
                                    batch_size = batch_size, 
                                    class_labels = class_labels,
@@ -206,9 +226,19 @@ def train_rectified_flow(rank : int,
     timer = Timer()      
     scaler = torch.GradScaler()    
 
+    def save_model(i):
+        # only save the model in the main process
+        if rank == 0:
+            model_name = f"model-{i}.pt"
+            # save the model here, first we need to unwrap the module
+            torch.save(model.module, os.path.join(wandb.run.dir, model_name))
+            # Save a model file manually from the current directory:
+            wandb.save(model_name)
     for i in tqdm(range(epoch), position=0, leave=True):
         if i == 0:
-            eval_image()
+            save_model("before")
+        # if i == 0:
+        #     eval_image()
         # reset sampler
         if sampler is not None:
             sampler.set_epoch(i)
@@ -222,7 +252,12 @@ def train_rectified_flow(rank : int,
             class_labels = class_labels.to(device)
             noise = torch.randn(image.shape).to(device)
             assert image.dtype == noise.dtype
-            timestep = torch.randint(high = max_timestep, size=(image.size(0),)).to(device)
+            if sample_type == "uniform":
+                timestep = torch.randint(high = max_timestep, size=(image.size(0),)).to(device)
+            elif sample_type == "lm":
+                x = torch.tensor([lmpdf((i + 1/2)/max_timestep) + 0.1 for i in range(max_timestep)]).to(device)
+                x = x/x.sum()
+                timestep = torch.multinomial(x, image.size(0))
             alpha = (timestep / max_timestep).view(-1, *([1]*(len(image.shape) - 1)))
             point = (1 - alpha) * noise + alpha * image
 
@@ -245,6 +280,7 @@ def train_rectified_flow(rank : int,
             scaler.step(optimizer)
             # Updates the scale for next iteration.
             scaler.update()
+            scheduler.step()
             dist.all_reduce(avg_values, op=dist.ReduceOp.AVG)
             if rank == 0:
                 timer.step()
@@ -252,6 +288,8 @@ def train_rectified_flow(rank : int,
                 wandb.log({"grad_scale" : scaler.get_scale()}, commit=False)
                 wandb.log({"grad_norm": grad_norm.item()}, commit = False)
                 wandb.log({"loss": avg_values[0].item()}, commit=True)
+        
+        save_model(i)
         eval_image()
 
 # === util ===
@@ -319,6 +357,9 @@ def main(rank, world_size, temp_dir, args, config):
     # num_embeds_ada_norm = len(dataset.classes)
     model_config = config["model"]
     # we only call wandb in the first process
+    sample_type = "uniform"
+    if "sample_type" in config:
+        sample_type = config["sample_type"]
     if rank == 0:
         print(model_config)
         wandb.login()
@@ -340,6 +381,9 @@ def main(rank, world_size, temp_dir, args, config):
                 "dataset" : str(dataset),
                 "dataset_type" : dataset_type,
                 "dtype" : str(dtype),
+                "config" : config,
+                "args" : args,
+                "sample_type" : sample_type
             },
             name = config["run"],
             mode = mode
@@ -353,23 +397,37 @@ def main(rank, world_size, temp_dir, args, config):
     else:
         from model import DiTModelWrapper
         model = DiTModelWrapper(**model_config)
+    # model = torch.compile(model)
     model = model.to(rank)
     model = DDP(model)
     if rank == 0:
         print(model)
         print("model size:", sum([p.numel() for p in model.parameters()]))
-    optimizer = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=torch.optim.AdamW, lr = lr, weight_decay=0.0)
+    optimizer_type = "adamw"
+    if "optimizer_type" in config:
+        optimizer_type = config["optimizer_type"]
+    assert optimizer_type in ["adamw", "lion"]
+    if optimizer_type == "adamw":
+        optimizer_class = torch.optim.AdamW
+    elif optimizer_type == "lion":
+        from lion_pytorch import Lion
+        optimizer_class = Lion
+    optimizer = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=optimizer_class, lr = lr, weight_decay=0.0)
+    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=2000)
+
     train_rectified_flow(
                     rank,
                     world_size,
                     model, 
                     optimizer, 
+                    scheduler,
                     dataloader, 
                     sampler,
                     datasetinfo,
                     max_timestep=max_timestep, 
                     epoch=epochs,
-                    dtype = dtype)
+                    dtype = dtype,
+                    sample_type=sample_type)
     if rank == 0:
         wandb.finish()
     cleanup()

@@ -1,0 +1,25 @@
+{
+    "run": "imagenet32-fp32-128epoch-50M-t-256",
+    "epochs": 128,
+    "max_timestep": 512,
+    "dtype": "fp32",
+    "dataset_type": "imagenet-32",
+    "model": {
+        "num_attention_heads": 12,
+        "attention_head_dim": 32,
+        "in_channels": 3,
+        "out_channels": null,
+        "num_layers": 12,
+        "dropout": 0.0,
+        "norm_num_groups": 32,
+        "attention_bias": true,
+        "sample_size": 32,
+        "patch_size": 2,
+        "activation_fn": "gelu-approximate",
+        "num_embeds_ada_norm": 1000,
+        "upcast_attention": false,
+        "norm_type": "ada_norm_zero",
+        "norm_elementwise_affine": false,
+        "norm_eps": 1e-05
+    }
+}
