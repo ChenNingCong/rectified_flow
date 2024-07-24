@@ -1,15 +1,15 @@
 {
-    "run": "imagenet.uint8-origin-bf16-128epoch-200M-t-1000-lmsample-lion",
+    "run": "mj-origin-bf16-128epoch-50M-t-1000-lmsample",
     "epochs": 128,
     "max_timestep": 1000,
     "dtype": "bf16",
-    "dataset_type": "imagenet.uint8",
+    "dataset_type": "mj",
     "model": {
         "num_attention_heads": 12,
-        "attention_head_dim": 64,
+        "attention_head_dim": 32,
         "in_channels": 4,
         "out_channels": null,
-        "num_layers": 24,
+        "num_layers": 12,
         "dropout": 0.0,
         "norm_num_groups": 32,
         "attention_bias": true,
@@ -23,7 +23,5 @@
         "norm_eps": 1e-05
     },
     "model_type": "origin",
-    "sample_type": "lm",
-    "lr": 1e-05,
-    "optimizer_type": "lion"
+    "sample_type": "lm"
 }

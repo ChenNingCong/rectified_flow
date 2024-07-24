@@ -1,7 +1,7 @@
 {
-    "run": "imagenet.uint8-origin-bf16-128epoch-200M-t-1000-lmsample-lion",
+    "run": "imagenet.uint8-origin-bf16-128epoch-200M-t-512-lmsample",
     "epochs": 128,
-    "max_timestep": 1000,
+    "max_timestep": 512,
     "dtype": "bf16",
     "dataset_type": "imagenet.uint8",
     "model": {
@@ -23,7 +23,5 @@
         "norm_eps": 1e-05
     },
     "model_type": "origin",
-    "sample_type": "lm",
-    "lr": 1e-05,
-    "optimizer_type": "lion"
+    "sample_type": "lm"
 }

@@ -131,6 +131,53 @@ def get_dataset(rank : int, dataset_type, data_dir, temp_dir, batch_size : int) 
         vae_preprocessor = lambda x : x * scaling_factor
         vae = vae.eval()
         vae_postprocessor = VaeImageProcessor(do_normalize=True)
+    elif dataset_type == "mj":
+        is_streaming_dataset = False
+        image_shape = (4, 32, 32)
+        is_latent = True  
+        from torch import Tensor
+        """
+        Convert latent to unit variance
+        """
+        class LatentProcessor:
+            def __init__(self):
+                self.mean = 0.8965
+                self.scale_factor = 0.13025
+            @torch.no_grad
+            def preprocess(self, latents : Tensor):
+                latents = (latents - self.mean) * self.scale_factor
+                return latents.float()
+            @torch.no_grad
+            def postprocess(self, latents : Tensor):
+                assert isinstance(latents, Tensor)
+                latents = self.mean + (latents / self.scale_factor)
+                # the vae is in fp16 so...
+                return latents.half()
+            def test(self, latents):
+                return (self.postprocess(self.preprocess(latents)) - latents).abs().mean()
+
+        latent_processor = LatentProcessor()
+        class DatasetAdaptor(torch.utils.data.Dataset):
+            def __init__(self) -> None:
+                self.latents = np.load(os.path.join(data_dir, "small_ldt/mj_latents.npy"), mmap_mode='r') 
+            def __len__(self):
+                return len(self.latents)
+            def __getitem__(self, idx:int):
+                x = latent_processor.preprocess(torch.tensor(self.latents[idx]))
+                y = 0
+                return x, int(y)
+        class ImageProcessor:
+            def postprocess(self, image, *args, **kwargs):
+                return (image + 1) / 2
+        dataset = DatasetAdaptor()
+        # unconditional generation, we only use one class
+        classes = [str(i) for i in range(1)]
+        vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16).to(rank)
+        vae = vae.eval()
+        # covert unit variance latent back to unscaled latent
+        vae_preprocessor = latent_processor.postprocess
+        # convert [-1, 1] image to [0, 1] scaled
+        vae_postprocessor = ImageProcessor()
     if image_shape is None:
         image_shape = dataset[0][0].shape
     if classes is None:
@@ -152,10 +199,9 @@ def make_dataloader(*args, use_fake=False, **kwargs):
 def sample_image(rank : int, model, max_timestep, batch_size, class_labels, datasetinfo : ImageDatasetInfo, use_classlabel, device):
     image_shape = datasetinfo.image_shape
     # we add a generator to better monitor the quality here
-    generator = torch.Generator()
-    generator = generator.manual_seed(rank)
-    X0 = torch.randn((batch_size, *image_shape), generator=generator).to(device)
+    X0 = torch.randn((batch_size, *image_shape)).to(device)
     for i in range(max_timestep):
+        # we use a uniform sampling here
         timestep = torch.full(size=(batch_size,), fill_value=i).to(device)
         if use_classlabel:
             pred = model(X0, timestep=timestep, class_labels = class_labels)
@@ -237,8 +283,8 @@ def train_rectified_flow(rank : int,
     for i in tqdm(range(epoch), position=0, leave=True):
         if i == 0:
             save_model("before")
-        # if i == 0:
-        #     eval_image()
+        if i == 0:
+            eval_image()
         # reset sampler
         if sampler is not None:
             sampler.set_epoch(i)
@@ -253,14 +299,14 @@ def train_rectified_flow(rank : int,
             noise = torch.randn(image.shape).to(device)
             assert image.dtype == noise.dtype
             if sample_type == "uniform":
-                timestep = torch.randint(high = max_timestep, size=(image.size(0),)).to(device)
+                timestep = torch.rand(size=(image.size(0),)).to(device) * max_timestep
             elif sample_type == "lm":
                 x = torch.tensor([lmpdf((i + 1/2)/max_timestep) + 0.1 for i in range(max_timestep)]).to(device)
                 x = x/x.sum()
-                timestep = torch.multinomial(x, image.size(0))
+                timestep = torch.multinomial(x, image.size(0)).to(torch.float32) # [0, max_timestep-1]
+                timestep += torch.rand(size=(image.size(0),)).to(device) # [0, max_timestep)
             alpha = (timestep / max_timestep).view(-1, *([1]*(len(image.shape) - 1)))
             point = (1 - alpha) * noise + alpha * image
-
             avg_values = torch.zeros((1,), device=rank)
             with torch.autocast(enabled=(dtype != torch.float32), device_type="cuda", dtype=dtype):
                 if use_classlabel:
@@ -313,6 +359,19 @@ def setup(rank, world_size):
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
+    # === reproducibility ===
+    # we give a different seed on every model
+    # this won't impact model weight, because DDP will copy weights
+    # and this won't impact data sampler
+    # we need to apply a different seed
+    # otherwise, we always get the same seed on every device, which may break the diffusion model!
+    import random
+    random.seed(rank)
+    import numpy as np
+    np.random.seed(rank)
+    torch.manual_seed(rank)
+    torch.cuda.manual_seed(rank)
+    
 
 def cleanup():
     dist.destroy_process_group()

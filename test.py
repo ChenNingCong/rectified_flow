@@ -296,26 +296,7 @@ print(create_run_config("imagenet.uint8-origin-bf16-128epoch-200M-t-1000-lmsampl
                                                                  "num_embeds_ada_norm": 1000,
                                                                  "norm_num_groups": 32,
                                                                  "in_channels" : 4}})) 
-
-
- # imagenet
-# imagenet is 10x larger than cifar, so we shrink the epoch size...
-print(create_run_config("imagenet32-origin-fp32-128epoch-50M-t-1000-lmsample", base_config, {"dtype" : "fp32", 
-                                                             "dataset_type" : "imagenet-32", 
-                                                             "epochs" : 128,
-                                                             "max_timestep" : 1000,
-                                                             "model_type" : "origin",
-                                                             "sample_type": "lm",
-                                                             "lr" : 3e-5, # for lion optimizer, the learning rate should be 3-10x smaller
-                                                             "optimizer_type" : "lion",
-                                                             "model" : {
-                                                                 "num_attention_heads": 12,
-                                                                 "attention_head_dim": 32,
-                                                                 "sample_size": 32,
-                                                                 "num_layers": 12,
-                                                                 "num_embeds_ada_norm": 1000,
-                                                                 "norm_num_groups": 32,
-                                                                 "in_channels" : 3}}))                 
+         
 
 print(create_run_config("imagenet.uint8-origin-bf16-128epoch-200M-t-1000-lmsample-lion", base_config, {"dtype" : "bf16", 
                                                              "dataset_type" : "imagenet.uint8", 
@@ -334,4 +315,50 @@ print(create_run_config("imagenet.uint8-origin-bf16-128epoch-200M-t-1000-lmsampl
                                                                  "norm_num_groups": 32,
                                                                  "in_channels" : 4}})) 
 
+print(create_run_config("imagenet.uint8-origin-bf16-128epoch-200M-t-1000-lmsample-rotary", base_config, {"dtype" : "bf16", 
+                                                             "dataset_type" : "imagenet.uint8", 
+                                                             "epochs" : 128,
+                                                             "max_timestep" : 1000,
+                                                             "model_type" : "origin",
+                                                             "sample_type": "lm",
+                                                             "model" : {
+                                                                 "attention_type" : "RotaryAttention",
+                                                                 "num_attention_heads": 12,
+                                                                 "attention_head_dim": 64,
+                                                                 "sample_size": 32,
+                                                                 "num_layers": 24,
+                                                                 "num_embeds_ada_norm": 1000,
+                                                                 "norm_num_groups": 32,
+                                                                 "in_channels" : 4}})) 
+
+print(create_run_config("mj-origin-bf16-128epoch-100M-t-1000-lmsample", base_config, {"dtype" : "bf16", 
+                                                             "dataset_type" : "mj", 
+                                                             "batch_size" : 512,
+                                                             "epochs" : 128,
+                                                             "max_timestep" : 1000,
+                                                             "model_type" : "origin",
+                                                             "sample_type": "lm",
+                                                             "model" : {
+                                                                 "num_attention_heads": 12,
+                                                                 "attention_head_dim": 64,
+                                                                 "sample_size": 32,
+                                                                 "num_layers": 12,
+                                                                 "num_embeds_ada_norm": 1000,
+                                                                 "norm_num_groups": 32,
+                                                                 "in_channels" : 4}})) 
                                                                                                                  
+
+print(create_run_config("imagenet.uint8-origin-bf16-128epoch-200M-t-512-lmsample", base_config, {"dtype" : "bf16", 
+                                                             "dataset_type" : "imagenet.uint8", 
+                                                             "epochs" : 128,
+                                                             "max_timestep" : 512,
+                                                             "model_type" : "origin",
+                                                             "sample_type": "lm",
+                                                             "model" : {
+                                                                 "num_attention_heads": 12,
+                                                                 "attention_head_dim": 64,
+                                                                 "sample_size": 32,
+                                                                 "num_layers": 24,
+                                                                 "num_embeds_ada_norm": 1000,
+                                                                 "norm_num_groups": 32,
+                                                                 "in_channels" : 4}}))                                                                                                             

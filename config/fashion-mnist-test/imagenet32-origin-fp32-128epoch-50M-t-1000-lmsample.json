@@ -23,7 +23,5 @@
         "norm_eps": 1e-05
     },
     "model_type": "origin",
-    "sample_type": "lm",
-    "lr": 3e-05,
-    "optimizer_type": "lion"
+    "sample_type": "lm"
 }

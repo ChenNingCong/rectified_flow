@@ -1,5 +1,5 @@
 {
-    "run": "imagenet.uint8-origin-bf16-128epoch-200M-t-1000-lmsample-lion",
+    "run": "imagenet.uint8-origin-bf16-128epoch-200M-t-1000-lmsample-rotary",
     "epochs": 128,
     "max_timestep": 1000,
     "dtype": "bf16",
@@ -20,10 +20,9 @@
         "upcast_attention": false,
         "norm_type": "ada_norm_zero",
         "norm_elementwise_affine": false,
-        "norm_eps": 1e-05
+        "norm_eps": 1e-05,
+        "attention_type": "RotaryAttention"
     },
     "model_type": "origin",
-    "sample_type": "lm",
-    "lr": 1e-05,
-    "optimizer_type": "lion"
+    "sample_type": "lm"
 }
