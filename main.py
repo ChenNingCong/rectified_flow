@@ -39,6 +39,7 @@ class ImageDatasetInfo:
     vae : Any
     vae_preprocessor : Any
     vae_postprocessor : Any
+    class_condition : bool
 
 # === data ===
 def get_dataset(rank : int, dataset_type, data_dir, temp_dir, batch_size : int) -> ImageDatasetInfo:
@@ -50,6 +51,7 @@ def get_dataset(rank : int, dataset_type, data_dir, temp_dir, batch_size : int) 
     vae = None
     vae_preprocessor = None
     vae_postprocessor = None
+    class_condition = True
     if dataset_type == "mnist":    
         transform = v2.Compose(
             [v2.ToImage(),
@@ -135,6 +137,7 @@ def get_dataset(rank : int, dataset_type, data_dir, temp_dir, batch_size : int) 
         is_streaming_dataset = False
         image_shape = (4, 32, 32)
         is_latent = True  
+        class_condition = False
         from torch import Tensor
         """
         Convert latent to unit variance
@@ -160,12 +163,13 @@ def get_dataset(rank : int, dataset_type, data_dir, temp_dir, batch_size : int) 
         class DatasetAdaptor(torch.utils.data.Dataset):
             def __init__(self) -> None:
                 self.latents = np.load(os.path.join(data_dir, "small_ldt/mj_latents.npy"), mmap_mode='r') 
+                self.text_emb = np.load(os.path.join(data_dir, "small_ldt/mj_text_emb.npy"), mmap_mode='r') 
             def __len__(self):
                 return len(self.latents)
             def __getitem__(self, idx:int):
-                x = latent_processor.preprocess(torch.tensor(self.latents[idx]))
-                y = 0
-                return x, int(y)
+                x = latent_processor.preprocess(torch.tensor(self.latents[idx], requires_grad=False))
+                y = torch.tensor(self.text_emb[idx], requires_grad=False)
+                return x, y
         class ImageProcessor:
             def postprocess(self, image, *args, **kwargs):
                 return (image + 1) / 2
@@ -182,7 +186,7 @@ def get_dataset(rank : int, dataset_type, data_dir, temp_dir, batch_size : int) 
         image_shape = dataset[0][0].shape
     if classes is None:
         classes = dataset.classes
-    return ImageDatasetInfo(dataset, is_streaming_dataset, image_shape, classes, is_latent, vae, vae_preprocessor, vae_postprocessor)
+    return ImageDatasetInfo(dataset, is_streaming_dataset, image_shape, classes, is_latent, vae, vae_preprocessor, vae_postprocessor, class_condition)
 
 def make_dataloader(*args, use_fake=False, **kwargs):
     if use_fake:
@@ -196,18 +200,19 @@ def make_dataloader(*args, use_fake=False, **kwargs):
 
 # === training and evaluation ===
 @torch.no_grad
-def sample_image(rank : int, model, max_timestep, batch_size, class_labels, datasetinfo : ImageDatasetInfo, use_classlabel, device):
+def sample_image(rank : int, model, max_timestep: int, sampling_step : int, batch_size, class_labels, datasetinfo : ImageDatasetInfo, use_classlabel, device):
     image_shape = datasetinfo.image_shape
     # we add a generator to better monitor the quality here
     X0 = torch.randn((batch_size, *image_shape)).to(device)
-    for i in range(max_timestep):
+    for i in range(sampling_step):
+        val = (i / sampling_step) * max_timestep
         # we use a uniform sampling here
-        timestep = torch.full(size=(batch_size,), fill_value=i).to(device)
+        timestep = torch.full(size=(batch_size,), fill_value=val).to(device)
         if use_classlabel:
             pred = model(X0, timestep=timestep, class_labels = class_labels)
         else:
             pred = model(X0, timestep=timestep)
-        X0 += pred.sample * (1/max_timestep)
+        X0 += pred.sample * (1 / sampling_step)
     if datasetinfo.is_latent:
         X0 = datasetinfo.vae_preprocessor(X0)
         X0 = datasetinfo.vae.decode(X0).sample
@@ -229,6 +234,7 @@ def train_rectified_flow(rank : int,
                          datasetinfo : ImageDatasetInfo,
                          use_classlabel = True,
                          max_timestep = 1000,
+                         sampling_step = 50,
                          epoch = 16, 
                          dtype = torch.float16,
                          sample_type = "uniform"):
@@ -244,13 +250,20 @@ def train_rectified_flow(rank : int,
         model.eval()
         assert world_size < 64 and 64 % world_size == 0
         total_batch_size = 64
-        class_labels = torch.arange(total_batch_size, device=rank) % max_class 
+        if datasetinfo.class_condition:
+            class_labels = torch.arange(total_batch_size, device=rank) % max_class      
+        else:
+            class_labels = []
+            for i in range(total_batch_size):
+                class_labels.append(datasetinfo.dataset[i][1])
+            class_labels = torch.stack(class_labels, dim=0).to(device)
         step = total_batch_size // world_size
         class_labels = class_labels[(rank*step):((rank+1)*step)]
         batch_size = step
         image_array = sample_image(rank,
                                    model, 
                                    max_timestep,
+                                   sampling_step,
                                    batch_size = batch_size, 
                                    class_labels = class_labels,
                                    datasetinfo = datasetinfo,
@@ -276,8 +289,8 @@ def train_rectified_flow(rank : int,
         # only save the model in the main process
         if rank == 0:
             model_name = f"model-{i}.pt"
-            # save the model here, first we need to unwrap the module
-            torch.save(model.module, os.path.join(wandb.run.dir, model_name))
+            # save the model here, first we need to unwrap the DDP module, then the torch.compile module
+            torch.save(model.module._orig_mod, os.path.join(wandb.run.dir, model_name))
             # Save a model file manually from the current directory:
             wandb.save(model_name)
     for i in tqdm(range(epoch), position=0, leave=True):
@@ -305,6 +318,13 @@ def train_rectified_flow(rank : int,
                 x = x/x.sum()
                 timestep = torch.multinomial(x, image.size(0)).to(torch.float32) # [0, max_timestep-1]
                 timestep += torch.rand(size=(image.size(0),)).to(device) # [0, max_timestep)
+            elif sample_type == "lognorm0_1":
+                x = torch.randn(size=(image.size(0),)).to(device)
+                # map [-inf, inf] to [0, 1]
+                x = torch.sigmoid(x)
+                # scale the timestep into [0, max_timestep]
+                timestep = x * max_timestep
+
             alpha = (timestep / max_timestep).view(-1, *([1]*(len(image.shape) - 1)))
             point = (1 - alpha) * noise + alpha * image
             avg_values = torch.zeros((1,), device=rank)
@@ -371,6 +391,8 @@ def setup(rank, world_size):
     np.random.seed(rank)
     torch.manual_seed(rank)
     torch.cuda.manual_seed(rank)
+    # enable fp32 here
+    torch.set_float32_matmul_precision("high")
     
 
 def cleanup():
@@ -411,10 +433,12 @@ def main(rank, world_size, temp_dir, args, config):
             dataloader = make_dataloader(dataset, use_fake=use_fake, batch_size=batch_size, drop_last=True, shuffle=True)
         else:
             sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed = 0, drop_last=True)
-            dataloader = torch.utils.data.DataLoader(dataset, batch_size=per_device_batch_size, sampler=sampler)
+            dataloader = torch.utils.data.DataLoader(dataset, batch_size=per_device_batch_size, sampler=sampler, drop_last=True)
 
     # num_embeds_ada_norm = len(dataset.classes)
     model_config = config["model"]
+    # hack : set condition type here with a parameter
+    model_config["class_condition"] = datasetinfo.class_condition
     # we only call wandb in the first process
     sample_type = "uniform"
     if "sample_type" in config:
@@ -456,7 +480,7 @@ def main(rank, world_size, temp_dir, args, config):
     else:
         from model import DiTModelWrapper
         model = DiTModelWrapper(**model_config)
-    # model = torch.compile(model)
+    model = torch.compile(model)
     model = model.to(rank)
     model = DDP(model)
     if rank == 0:

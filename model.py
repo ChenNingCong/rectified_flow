@@ -99,6 +99,33 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
+import torch.nn as nn
+class TextEmbedder(nn.Module):
+    """
+    Encode text embedding 
+    """
+    def __init__(self, hidden_size, dropout_prob):
+        super().__init__()
+        self.null_cond = nn.Parameter(torch.zeros(hidden_size,), requires_grad=True)
+        self.dropout_prob = dropout_prob
+
+    def token_drop(self, labels, force_drop_ids=None):
+        """
+        Drops text embeddings to enable classifier-free guidance.
+        """
+        if force_drop_ids is None:
+            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        labels = torch.where(drop_ids.unsqueeze(-1), self.null_cond.unsqueeze(0), labels)
+        return labels
+
+    def forward(self, labels, train, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+        return labels
+
 
 #################################################################################
 #                                 Core DiT Model                                #
@@ -164,6 +191,7 @@ class DiT(nn.Module):
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
+        class_condition : bool = True,
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
@@ -179,7 +207,11 @@ class DiT(nn.Module):
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.class_condition = class_condition
+        if class_condition:
+            self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        else:
+            self.y_embedder = TextEmbedder(hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -209,8 +241,9 @@ class DiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        if self.class_condition:
+            # Initialize label embedding table:
+            nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -416,7 +449,8 @@ def DiTModelWrapper(
         norm_type: str = "ada_norm_zero",
         norm_elementwise_affine: bool = False,
         norm_eps: float = 1e-5,
-        attention_type : str = "NormalAttention"):
+        attention_type : str = "NormalAttention",
+        class_condition=True):
     assert out_channels is None or out_channels == in_channels
     assert norm_eps == 1e-5
     assert not norm_elementwise_affine
@@ -434,6 +468,7 @@ def DiTModelWrapper(
         depth=num_layers,
         num_heads=num_attention_heads,
         mlp_ratio=4,
+        class_condition=class_condition,
         class_dropout_prob=0.1,
         num_classes=num_embeds_ada_norm,
         learn_sigma=False,

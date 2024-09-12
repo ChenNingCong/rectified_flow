@@ -362,3 +362,34 @@ print(create_run_config("imagenet.uint8-origin-bf16-128epoch-200M-t-512-lmsample
                                                                  "num_embeds_ada_norm": 1000,
                                                                  "norm_num_groups": 32,
                                                                  "in_channels" : 4}}))                                                                                                             
+
+
+print(create_run_config("mj-origin-bf16-128epoch-200M-t-512-lmsample", base_config, {"dtype" : "bf16", 
+                                                             "dataset_type" : "mj", 
+                                                             "epochs" : 128,
+                                                             "max_timestep" : 512,
+                                                             "model_type" : "origin",
+                                                             "sample_type": "lm",
+                                                             "model" : {
+                                                                 "num_attention_heads": 12,
+                                                                 "attention_head_dim": 64,
+                                                                 "sample_size": 32,
+                                                                 "num_layers": 24,
+                                                                 "num_embeds_ada_norm": 1000,
+                                                                 "norm_num_groups": 32,
+                                                                 "in_channels" : 4}})) 
+
+print(create_run_config("imagenet.uint8-origin-bf16-128epoch-200M-t-512-lognormsample", base_config, {"dtype" : "bf16", 
+                                                             "dataset_type" : "imagenet.uint8", 
+                                                             "epochs" : 128,
+                                                             "max_timestep" : 512,
+                                                             "model_type" : "origin",
+                                                             "sample_type": "lognorm0_1",
+                                                             "model" : {
+                                                                 "num_attention_heads": 12,
+                                                                 "attention_head_dim": 64,
+                                                                 "sample_size": 32,
+                                                                 "num_layers": 24,
+                                                                 "num_embeds_ada_norm": 1000,
+                                                                 "norm_num_groups": 32,
+                                                                 "in_channels" : 4}}))   
